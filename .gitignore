@@ -1,0 +1,17 @@
+# Frontend Dependencies & Builds
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+
+# Backend Dependencies & Environments
+backend/venv/
+backend/.env
+backend/__pycache__/
+backend/**/*.pyc
+backend/.pytest_cache/
+
+# System & IDE files
+.DS_Store
+.vscode/
+.idea/
