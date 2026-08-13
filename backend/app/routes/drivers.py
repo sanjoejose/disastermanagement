@@ -1,22 +1,143 @@
-from fastapi import APIRouter, HTTPException, Query
-from app.database import get_db_connection
+import math
 from urllib.parse import quote
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from app.database import get_db_connection
 
 router = APIRouter(prefix="/api/v1/drivers", tags=["Drivers"])
+
+
+# --- PYDANTIC SCHEMAS ---
+class AcceptRoutePayload(BaseModel):
+    driver_id: str = Field(..., description="UUID of the driver accepting the route")
+    supply_id: str = Field(..., description="UUID of the supply listing being picked up")
+    request_id: str = Field(..., description="UUID of the relief/evacuation request")
+
+
+# --- ENDPOINTS ---
+
+@router.get("/discover-nearby")
+async def discover_nearby_supplies_and_evacuations(
+    driver_lat: float = Query(..., ge=-90.0, le=90.0, example=9.9661, description="Driver's current latitude"),
+    driver_lon: float = Query(..., ge=-180.0, le=180.0, example=76.3190, description="Driver's current longitude"),
+    radius_km: float = Query(5.0, ge=1.0, le=50.0, description="Search radius in kilometers around driver")
+):
+    """
+    1. Driver-Centric Discovery (Evacuations First!):
+    Scans the driver's vicinity for both active EVACUATION requests 
+    and AVAILABLE supply hubs, giving immediate priority to life safety.
+    """
+    radius_meters = radius_km * 1000.0
+    conn = await get_db_connection()
+    try:
+        # A. Fetch nearby urgent EVACUATION requests within radius
+        evacuations_nearby = await conn.fetch(
+            """
+            SELECT 
+                r.id AS request_id,
+                r.category,
+                r.headcount_adults,
+                r.headcount_children,
+                r.headcount_infants,
+                (r.headcount_adults + r.headcount_children + r.headcount_infants) AS total_headcount,
+                r.is_sos,
+                r.is_missing_person,
+                r.landmark_notes,
+                r.priority_score,
+                u.full_name AS requester_name,
+                u.phone_number AS requester_phone,
+                ST_Y(r.location::geometry) AS lat,
+                ST_X(r.location::geometry) AS lon,
+                ST_Distance(
+                    r.location, 
+                    ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
+                ) AS distance_meters
+            FROM requests r
+            JOIN users u ON r.requester_id = u.id
+            WHERE r.status = 'PENDING'
+              AND r.request_type = 'EVACUATION'
+              AND ST_DWithin(
+                  r.location, 
+                  ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 
+                  $3
+              )
+            ORDER BY r.is_sos DESC, r.priority_score DESC, distance_meters ASC;
+            """,
+            driver_lon, driver_lat, radius_meters
+        )
+
+        formatted_evacuations = []
+        for e in evacuations_nearby:
+            ed = dict(e)
+            ed["distance_km"] = round(e["distance_meters"] / 1000, 2)
+            ed["phone_call_link"] = f"tel:{e['requester_phone']}"
+            formatted_evacuations.append(ed)
+
+        # B. Fetch nearby active supply hubs
+        supplies_nearby = await conn.fetch(
+            """
+            SELECT 
+                s.id AS supply_id,
+                s.supplier_id,
+                s.category,
+                s.food_type,
+                s.quantity,
+                s.expires_at,
+                u.full_name AS supplier_name,
+                u.phone_number AS supplier_phone,
+                ST_Y(s.location::geometry) AS supply_lat,
+                ST_X(s.location::geometry) AS supply_lon,
+                ST_Distance(
+                    s.location, 
+                    ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
+                ) AS distance_meters
+            FROM supplies s
+            JOIN users u ON s.supplier_id = u.id
+            WHERE s.status = 'AVAILABLE' 
+              AND s.expires_at > CURRENT_TIMESTAMP
+              AND ST_DWithin(
+                  s.location, 
+                  ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 
+                  $3
+              )
+            ORDER BY distance_meters ASC;
+            """,
+            driver_lon, driver_lat, radius_meters
+        )
+
+        formatted_supplies = []
+        for sup in supplies_nearby:
+            s_dict = dict(sup)
+            s_dict["distance_km"] = round(sup["distance_meters"] / 1000, 2)
+            s_dict["expires_at"] = sup["expires_at"].isoformat()
+            formatted_supplies.append(s_dict)
+
+        return {
+            "status": "success",
+            "driver_location": {"lat": driver_lat, "lon": driver_lon},
+            "has_urgent_evacuations": len(formatted_evacuations) > 0,
+            "evacuation_count": len(formatted_evacuations),
+            "supply_hub_count": len(formatted_supplies),
+            "nearby_evacuations": formatted_evacuations,
+            "nearby_supplies": formatted_supplies
+        }
+    finally:
+        await conn.close()
+
 
 @router.get("/nearby-routes")
 async def get_nearby_routes(
     supplier_id: str,
-    radius_km: float = Query(5.0, ge=1.0, le=30.0, description="Search radius in kilometers")
+    radius_km: float = Query(5.0, ge=1.0, le=50.0, description="Search radius in kilometers")
 ):
     """
-    Finds active supply listings for a supplier, queries pending requests within 
-    the given radius using PostGIS ST_DWithin, and builds a Google Maps multi-stop URL.
+    2. Direction-Vector Route Generation (ST_Azimuth Cone Filtering):
+    Anchors the single highest-priority request (Wait time + SOS + Headcount - Distance)
+    and filters subsequent waypoints into a single 90-degree directional vector cone.
     """
     conn = await get_db_connection()
     try:
-        # 1. Fetch active supply listing for this supplier
         supply = await conn.fetchrow(
             """
             SELECT id, category, food_type, quantity, expires_at,
@@ -33,64 +154,89 @@ async def get_nearby_routes(
         if not supply:
             raise HTTPException(status_code=404, detail="No active, unexpired supplies found for this supplier.")
 
-        supplier_lat = supply['lat']
-        supplier_lon = supply['lon']
+        s_lat = supply['lat']
+        s_lon = supply['lon']
         category = supply['category']
         food_type = supply['food_type']
 
-        # Enforce perishability rules on radius
-        radius_meters = radius_km * 1000
+        radius_meters = radius_km * 1000.0
         if food_type == 'COOKED' and radius_km > 5.0:
-            # Hard-cap cooked food search to max 5km for food safety
             radius_meters = 5000.0
 
-        # 2. Query pending requests within the radius using PostGIS spatial indexing
         requests = await conn.fetch(
             """
+            WITH anchor_request AS (
+                SELECT 
+                    r.id AS anchor_id,
+                    r.location AS anchor_loc,
+                    ST_Azimuth(
+                        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 
+                        r.location
+                    ) AS anchor_angle
+                FROM requests r
+                WHERE r.status = 'PENDING'
+                  AND (r.category = $3 OR r.request_type = 'EVACUATION')
+                  AND ST_DWithin(r.location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $4)
+                ORDER BY (
+                    r.priority_score 
+                    + (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - r.created_at)) / 1800 * 5)
+                    - (ST_Distance(r.location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) / 1000 * 2)
+                ) DESC
+                LIMIT 1
+            )
             SELECT 
-                r.id AS request_id,
-                r.quantity_requested,
-                r.is_sos,
-                r.otp_code,
-                u.full_name AS requester_name,
+                r.id AS request_id, 
+                r.request_type, 
+                r.category, 
+                r.quantity_requested, 
+                r.headcount_adults, 
+                r.headcount_children, 
+                r.headcount_infants, 
+                r.is_sos, 
+                r.landmark_notes,
+                u.full_name AS requester_name, 
                 u.phone_number AS requester_phone,
-                ST_Y(r.location::geometry) AS lat,
+                ST_Y(r.location::geometry) AS lat, 
                 ST_X(r.location::geometry) AS lon,
-                ST_Distance(
-                    r.location, 
-                    ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
-                ) AS distance_meters
+                ST_Distance(r.location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) / 1000 AS distance_km,
+                (
+                    r.priority_score 
+                    + (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - r.created_at)) / 1800 * 5)
+                    - (ST_Distance(r.location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) / 1000 * 2)
+                ) AS dynamic_score
             FROM requests r
+            CROSS JOIN anchor_request a
             JOIN users u ON r.requester_id = u.id
             WHERE r.status = 'PENDING'
-              AND r.category = $3
-              AND ST_DWithin(
-                  r.location, 
-                  ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 
-                  $4
+              AND (r.category = $3 OR r.request_type = 'EVACUATION')
+              AND ST_DWithin(r.location, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, $4)
+              AND (
+                  ABS(ST_Azimuth(ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, r.location) - a.anchor_angle) < 0.785
+                  OR ABS(ST_Azimuth(ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, r.location) - a.anchor_angle) > (2 * PI() - 0.785)
               )
-            ORDER BY r.is_sos DESC, distance_meters ASC
-            LIMIT 9;
+            ORDER BY distance_km ASC
+            LIMIT 5;
             """,
-            supplier_lon, supplier_lat, category, radius_meters
+            s_lon, s_lat, category, radius_meters
         )
 
         if not requests:
             return {
                 "status": "success",
-                "message": "No matching pending requests found within range.",
-                "supply_info": dict(supply),
+                "message": "No matching pending requests within range.",
+                "supply_info": {
+                    "supply_id": str(supply["id"]),
+                    "category": supply["category"],
+                    "quantity": supply["quantity"]
+                },
                 "matched_requests": []
             }
 
-        # 3. Construct Google Maps Universal URL Deep Link
-        # Format: https://www.google.com/maps/dir/?api=1&origin=LAT,LON&destination=LAT,LON&waypoints=LAT1,LON1|LAT2,LON2
-        origin = f"{supplier_lat},{supplier_lon}"
+        origin = f"{s_lat},{s_lon}"
         destination = f"{requests[-1]['lat']},{requests[-1]['lon']}"
         
         waypoints_str = ""
         if len(requests) > 1:
-            # Intermediate stops before the final destination
             waypoint_coords = [f"{r['lat']},{r['lon']}" for r in requests[:-1]]
             waypoints_str = f"&waypoints={'|'.join(waypoint_coords)}"
 
@@ -105,8 +251,8 @@ async def get_nearby_routes(
         formatted_requests = []
         for r in requests:
             req_dict = dict(r)
-            req_dict["distance_km"] = round(r["distance_meters"] / 1000, 2)
-            # Add telephone link for pre-flight call verification
+            req_dict["distance_km"] = round(r["distance_km"], 2)
+            req_dict["dynamic_score"] = round(r["dynamic_score"], 2)
             req_dict["phone_call_link"] = f"tel:{r['requester_phone']}"
             formatted_requests.append(req_dict)
 
@@ -122,100 +268,110 @@ async def get_nearby_routes(
         await conn.close()
 
 
-@router.post("/verify-delivery")
-async def verify_delivery(request_id: str, input_otp: str):
+@router.get("/nearest-camp")
+async def get_nearest_camp(
+    pickup_lat: float = Query(..., ge=-90.0, le=90.0),
+    pickup_lon: float = Query(..., ge=-180.0, le=180.0)
+):
     """
-    Validates the 4-digit OTP provided by the requester upon physical delivery.
+    3. Relief Camp Auto-Routing:
+    Finds the nearest active relief camp with open capacity from the pickup point.
     """
     conn = await get_db_connection()
     try:
-        # Check matching request and OTP
-        req = await conn.fetchrow(
-            "SELECT otp_code, status FROM requests WHERE id = $1::uuid;",
-            request_id
+        camp = await conn.fetchrow(
+            """
+            SELECT 
+                id, name, contact_person, contact_phone, max_capacity, current_occupancy,
+                (max_capacity - current_occupancy) AS available_space,
+                ST_Y(location::geometry) AS lat, ST_X(location::geometry) AS lon,
+                ST_Distance(
+                    location, 
+                    ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
+                ) / 1000 AS distance_km
+            FROM camps
+            WHERE is_active = TRUE AND current_occupancy < max_capacity
+            ORDER BY location <-> ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
+            LIMIT 1;
+            """,
+            pickup_lon, pickup_lat
         )
 
-        if not req:
-            raise HTTPException(status_code=404, detail="Request ID not found.")
+        if not camp:
+            raise HTTPException(status_code=404, detail="No active relief camps with available capacity found nearby.")
 
-        if req["otp_code"] != input_otp:
-            raise HTTPException(status_code=400, detail="Invalid OTP code. Delivery verification failed.")
-
-        # Mark request as DELIVERED
-        await conn.execute(
-            "UPDATE requests SET status = 'DELIVERED', updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid;",
-            request_id
-        )
-
-        return {"status": "success", "message": "Delivery verified successfully! Order marked as DELIVERED."}
-
+        cd = dict(camp)
+        origin = f"{pickup_lat},{pickup_lon}"
+        destination = f"{camp['lat']},{camp['lon']}"
+        cd["navigation_url"] = f"https://www.google.com/maps/dir/?api=1&origin={quote(origin)}&destination={quote(destination)}&travelmode=driving"
+        
+        return {"status": "success", "recommended_camp": cd}
     finally:
         await conn.close()
 
-class AcceptRoutePayload(BaseModel):
-    driver_id: str
-    supply_id: str
-    request_id: str
 
 @router.post("/accept-route")
 async def accept_route(payload: AcceptRoutePayload):
     """
-    Locks a request by setting status='IN_TRANSIT' and deducts the requested 
-    quantity from the supplier's active inventory in a safe database transaction.
+    4. Route Lock & Inventory Deduction:
+    Transitions request status to 'IN_TRANSIT' and deducts stock inside an isolated transaction.
     """
     conn = await get_db_connection()
-    async with conn.transaction():  # Use DB transaction so both updates succeed or fail together
-        # 1. Fetch current supply and request data with lock
-        supply = await conn.fetchrow(
-            "SELECT quantity, status FROM supplies WHERE id = $1::uuid FOR UPDATE;",
-            payload.supply_id
-        )
-        request = await conn.fetchrow(
-            "SELECT quantity_requested, status FROM requests WHERE id = $1::uuid FOR UPDATE;",
-            payload.request_id
-        )
+    async with conn.transaction():
+        supply = await conn.fetchrow("SELECT quantity, status FROM supplies WHERE id = $1::uuid FOR UPDATE;", payload.supply_id)
+        request = await conn.fetchrow("SELECT quantity_requested, status, request_type FROM requests WHERE id = $1::uuid FOR UPDATE;", payload.request_id)
 
         if not supply or supply["status"] != "AVAILABLE":
             raise HTTPException(status_code=400, detail="Supply is no longer available.")
-
         if not request or request["status"] != "PENDING":
             raise HTTPException(status_code=400, detail="Request has already been accepted by another driver or cancelled.")
 
-        requested_qty = request["quantity_requested"]
-        available_qty = supply["quantity"]
+        if request["request_type"] == "SUPPLY":
+            if supply["quantity"] < request["quantity_requested"]:
+                raise HTTPException(status_code=400, detail="Insufficient supply stock.")
+            new_qty = supply["quantity"] - request["quantity_requested"]
+            new_status = "CLAIMED" if new_qty == 0 else "AVAILABLE"
+            await conn.execute("UPDATE supplies SET quantity = $1, status = $2 WHERE id = $3::uuid;", new_qty, new_status, payload.supply_id)
 
-        if available_qty < requested_qty:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Insufficient inventory. Only {available_qty} items left, but request demands {requested_qty}."
-            )
+        await conn.execute("UPDATE requests SET status = 'IN_TRANSIT', updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid;", payload.request_id)
+        return {"status": "success", "message": "Route accepted successfully! Request is now IN_TRANSIT."}
 
-        # 2. Deduct inventory quantity
-        new_qty = available_qty - requested_qty
-        new_supply_status = "CLAIMED" if new_qty == 0 else "AVAILABLE"
 
-        await conn.execute(
+@router.post("/verify-delivery")
+async def verify_delivery(
+    request_id: str, 
+    input_otp: str, 
+    rescued_count: int = Query(0, description="Actual number of persons rescued (if evacuation)")
+):
+    """
+    5. OTP Delivery / Evacuation Verification:
+    Validates recipient PIN and updates request status to FULFILLED.
+    """
+    conn = await get_db_connection()
+    try:
+        req = await conn.fetchrow(
             """
-            UPDATE supplies 
-            SET quantity = $1, status = $2 
-            WHERE id = $3::uuid;
-            """,
-            new_qty, new_supply_status, payload.supply_id
+            SELECT otp_code, (headcount_adults + headcount_children + headcount_infants) AS total_people 
+            FROM requests 
+            WHERE id = $1::uuid;
+            """, 
+            request_id
         )
+        if not req:
+            raise HTTPException(status_code=404, detail="Request ID not found.")
+        if req["otp_code"] != input_otp:
+            raise HTTPException(status_code=400, detail="Invalid OTP code. Verification failed.")
 
-        # 3. Transition request status to IN_TRANSIT
+        total_rescued = rescued_count if rescued_count > 0 else req["total_people"]
+
         await conn.execute(
             """
             UPDATE requests 
-            SET status = 'IN_TRANSIT', updated_at = CURRENT_TIMESTAMP 
-            WHERE id = $1::uuid;
+            SET status = 'FULFILLED', headcount_rescued = $1, updated_at = CURRENT_TIMESTAMP 
+            WHERE id = $2::uuid;
             """,
-            payload.request_id
+            total_rescued, request_id
         )
-
-        return {
-            "status": "success",
-            "message": "Route accepted successfully! Request is now IN_TRANSIT.",
-            "remaining_supply_quantity": new_qty,
-            "request_status": "IN_TRANSIT"
-        }
+        return {"status": "success", "message": "Delivery/Evacuation verified and marked as FULFILLED!"}
+    finally:
+        await conn.close()

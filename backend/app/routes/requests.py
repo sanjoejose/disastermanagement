@@ -5,24 +5,42 @@ from app.schemas import RequestCreate
 
 router = APIRouter(prefix="/api/v1/requests", tags=["Requests"])
 
+def calculate_priority_score(request_type: str, category: str, is_sos: bool, adults: int, children: int, infants: int) -> int:
+    score = 0
+    if request_type == "EVACUATION" or category.upper() == "EVACUATION":
+        score += 100
+    elif category.upper() in ["MEDICINE", "DRINKING WATER"]:
+        score += 50
+    else:
+        score += 20
+        
+    if is_sos:
+        score += 50
+        
+    score += (infants * 10) + (children * 5) + (adults * 2)
+    return score
+
 @router.post("")
 async def create_request(req: RequestCreate):
-    """
-    Registers a relief request, applies headcount-based capping,
-    and generates a delivery OTP code.
-    """
-    total_people = req.headcount_adults + req.headcount_children
+    total_people = req.headcount_adults + req.headcount_children + req.headcount_infants
     
-    # Anti-Hoarding Cap Rules
-    if req.category == "Drinking Water":
-        max_allowed = max(total_people * 3, 3)  # Max 3L per person
+    if req.category == "Drinking Water" and req.request_type == "SUPPLY":
+        max_allowed = max(total_people * 3, 3)
         if req.quantity_requested > max_allowed:
             raise HTTPException(
                 status_code=400, 
-                detail=f"Requested water quantity exceeds the limit of {max_allowed}L for {total_people} people."
+                detail=f"Requested water quantity exceeds limit of {max_allowed}L for {total_people} people."
             )
+
+    priority_score = calculate_priority_score(
+        request_type=req.request_type.value,
+        category=req.category,
+        is_sos=req.is_sos,
+        adults=req.headcount_adults,
+        children=req.headcount_children,
+        infants=req.headcount_infants
+    )
             
-    # Generate random 4-digit OTP
     otp_code = f"{random.randint(1000, 9999)}"
     
     conn = await get_db_connection()
@@ -30,22 +48,27 @@ async def create_request(req: RequestCreate):
         request_id = await conn.fetchval(
             """
             INSERT INTO requests (
-                requester_id, headcount_adults, headcount_children, headcount_infants,
-                category, quantity_requested, is_sos, otp_code, location
+                requester_id, request_type, category, 
+                headcount_adults, headcount_children, headcount_infants, quantity_requested,
+                is_missing_person, landmark_notes, is_sos, priority_score,
+                created_via, volunteer_id, otp_code, location
             )
             VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8,
-                ST_SetSRID(ST_MakePoint($9, $10), 4326)::geography
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::uuid, $14,
+                ST_SetSRID(ST_MakePoint($15, $16), 4326)::geography
             )
             RETURNING id;
             """,
-            req.requester_id, req.headcount_adults, req.headcount_children, req.headcount_infants,
-            req.category, req.quantity_requested, req.is_sos, otp_code,
+            req.requester_id, req.request_type.value, req.category,
+            req.headcount_adults, req.headcount_children, req.headcount_infants, req.quantity_requested,
+            req.is_missing_person, req.landmark_notes, req.is_sos, priority_score,
+            req.created_via, req.volunteer_id if req.volunteer_id else None, otp_code,
             req.longitude, req.latitude
         )
         return {
             "status": "success", 
             "request_id": str(request_id), 
+            "priority_score": priority_score,
             "otp_code": otp_code
         }
     finally:

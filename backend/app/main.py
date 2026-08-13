@@ -2,16 +2,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from app.database import get_db_connection
 
-# Import router modules
 from app.routes.users import router as users_router
 from app.routes.supplies import router as supplies_router
 from app.routes.requests import router as requests_router
-from app.routes.drivers import router as drivers_router  # <--- NEW
+from app.routes.drivers import router as drivers_router
+from app.routes.camps import router as camps_router
 
 app = FastAPI(
     title="Hyper-Local Disaster Relief API",
-    version="1.0.0",
-    description="Spatial routing and emergency supply matching engine using PostGIS."
+    version="2.0.0",
+    description="Spatial routing, evacuation matching, and relief camp navigation engine using PostGIS."
 )
 
 app.add_middleware(
@@ -26,11 +26,12 @@ app.add_middleware(
 app.include_router(users_router)
 app.include_router(supplies_router)
 app.include_router(requests_router)
-app.include_router(drivers_router)  # <--- NEW
+app.include_router(drivers_router)
+app.include_router(camps_router)
 
 @app.get("/")
 async def root():
-    return {"message": "Disaster Relief API is running 🚀"}
+    return {"message": "Disaster Relief API v2.0 is running 🚀"}
 
 @app.get("/api/v1/health")
 async def health_check():
